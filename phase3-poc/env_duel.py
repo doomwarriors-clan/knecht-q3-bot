@@ -52,18 +52,28 @@ pm_type, and every health value is treated as valid only in [0, 300]
 (real duel max = 100 + 100 suit). The garbage is what corrupted run-1
 rewards (rew 8.4e3, loss 3e11).
 
-ROBUSTNESS: on a map restart the restart_id changes -> prev state is
-dropped (no cross-map velocity/reward). If the client is ABSENT from
-the snapshots for >2 s (OSP can kick clients on "Server command
-overflow" during intermission; the normal map-restart disconnect/
-reconnect resolves within 2 s), the env adopts an existing same-name
-client or re-ADDs itself.
+ROBUSTNESS (2026-11-20, hardened after the run3 crash):
+- Map restart: restart_id changes -> prev state is dropped (no
+  cross-map velocity/reward).
+- Client ABSENT from snapshots for >2 s (OSP can kick clients on
+  "Server command overflow"; a normal map-restart disconnect/reconnect
+  resolves within 2 s) -> adopt an existing same-name client or
+  re-ADD self.
+- LOST sidecar connection (full server restart / engine death / tunnel
+  hiccup) can happen anywhere in a step -> the WHOLE step is guarded
+  (step()/_step split): one _reconnect() (90 s budget; re-socket,
+  re-adopt/re-ADD, repeater thread), then a clean episode boundary
+  (done=True, reward 0). The QVM opponent is re-added by the throttled
+  rcon guard (snapshot-based presence; rcon runs on knecht via ssh
+  loopback, tmp/rl/rcon.py). See recovery_test.py for the kill/start
+  exercise of this path.
 
 REWARD (PLACEHOLDER for the workload PoC -- not tuned for learning):
   +0.0005 / step while alive
   +0.05 on health increase (pickup)
   +0.002 per enemy hp point lost (while alive)
-  +0.5 on kill, -0.5 on own death (pm_type-based)
+  +0.5 on kill, -0.5 on own death (pm_type-based; death is a PENALTY, not
+  a terminal state -- only the intermission ends the episode)
   total clamped to [-1, 1] per step
 """
 
@@ -99,6 +109,13 @@ def _clamp(v, lo, hi):
 class DuelEnv:
     def __init__(self, sockpath: str, name: str = "rlbot"):
         self.name = name
+        self.sockpath = sockpath
+        # rcon helper on knecht (ssh + loopback): used to re-add the QVM
+        # opponent after it was kicked (OSP overflow / full server restart)
+        self.rcon_cmd = [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "hkuehnemund@192.168.69.25", "python3", "tmp/rl/rcon.py",
+        ]
         self.bc = Botctl(sockpath)
         self.bc.ping()
         self.slot = int(self.bc.add(name))
@@ -106,6 +123,9 @@ class DuelEnv:
             raise RuntimeError("botctl ADD failed (slot -1)")
         self.last_yaw = 0.0
         self.prev = None
+        self.dmg = 0.0
+        self.kills = 0
+        self._last_opp_check = 0.0
         self._action = np.zeros(ACT_DIM, dtype=np.float32)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._repeat_loop, daemon=True)
@@ -162,7 +182,9 @@ class DuelEnv:
         sv_timescale 10). The engine consumes staged inputs per tick and
         sends an idle cmd when the queue is empty, so this is what keeps
         the bot at a full movement duty cycle. Fire-and-forget; the
-        engine's 128-deep per-client queue absorbs jitter."""
+        engine's 128-deep per-client queue absorbs jitter. Connection
+        trouble (full server restart, tunnel hiccup) is handled by
+        step()/_reconnect; the thread just keeps retrying."""
         while not self._stop.is_set():
             a = self._action
             try:
@@ -174,8 +196,82 @@ class DuelEnv:
                 self.bc.cmd(self.slot, fwd, side, 0, buttons,
                             WP_MACHINEGUN, pitch, yaw)
             except Exception:
-                break
+                time.sleep(1.0)
+                continue
             self._stop.wait(CMD_PERIOD)
+
+    # ------------------------------------------------------- reconnection
+    def _ensure_conn(self, budget=90.0):
+        """Ping the sidecar; if dead, reconnect until budget is spent
+        (a full server restart takes ~15-20 s: FS_Startup + QVM recompile;
+        a cold engine start can take ~40 s, during which the socket does
+        not exist)."""
+        t0 = time.time()
+        while time.time() - t0 < budget:
+            try:
+                self.bc.ping()
+                return True
+            except Exception:
+                pass
+            try:
+                self.bc.close()
+            except Exception:
+                pass
+            time.sleep(1.0)
+            try:
+                self.bc = Botctl(self.sockpath)
+            except Exception:
+                continue
+        return False
+
+    def _reconnect(self):
+        """Re-establish everything after losing the connection: socket,
+        client adoption, repeater thread."""
+        if not self._ensure_conn():
+            raise ConnectionError("botctl: could not reconnect")
+        try:
+            adopted = False
+            for num, name in self.bc.list():
+                if name == self.name:
+                    self.slot = int(num)
+                    adopted = True
+                    break
+            if not adopted:
+                self.slot = int(self.bc.add(self.name))
+        except Exception:
+            if not self._ensure_conn():
+                raise ConnectionError("botctl: lost again during re-ADD")
+            self.slot = int(self.bc.add(self.name))
+        if not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._repeat_loop,
+                                            daemon=True)
+            self._thread.start()
+        self.prev = None
+
+    # ------------------------------------------------------- opponent guard
+    def _ensure_opponent(self):
+        """The QVM opponent can vanish (OSP 'Server command overflow'
+        kicks it, a full server restart does not re-add rcon bots).
+        Presence is judged from the SNAPSHOT (managed clients are visible
+        there but NOT in rcon 'status' -- both show up as 'bot' in the
+        address column there, so rcon cannot distinguish them). rcon is
+        used only for the actual addbot. Throttled to 10 s wall."""
+        now = time.time()
+        if now - self._last_opp_check < 10.0:
+            return
+        self._last_opp_check = now
+        try:
+            snap = self.bc.snap()
+        except Exception:
+            return
+        if any(n != self.slot for n in snap.players):
+            return
+        try:
+            import subprocess
+            subprocess.run(self.rcon_cmd + ["addbot", "dwcbot5", "5"],
+                           capture_output=True, text=True, timeout=20)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------- build obs
     def _build_obs(self, snap, prev_snap):
@@ -188,10 +284,13 @@ class DuelEnv:
         o[1] = py / 1000.0
         o[2] = pz / 1000.0
 
-        # velocity from the previous frame (game units per game-second)
+        # velocity from the previous frame (game units per game-second);
+        # only across two ALIVE states -- a death->respawn position jump
+        # would otherwise produce a huge one-frame velocity spike
         if prev_snap is not None:
             pm = self._me(prev_snap)
-            if pm is not None and snap.time > prev_snap.time:
+            if (self._alive(pm) and self._alive(me)
+                    and snap.time > prev_snap.time):
                 dt = (snap.time - prev_snap.time) / 1000.0
                 o[3] = (px - pm["origin"][0]) / dt / 1000.0
                 o[4] = (py - pm["origin"][1]) / dt / 1000.0
@@ -303,10 +402,32 @@ class DuelEnv:
         """Advance to the next new engine frame.
 
         Returns (obs, reward, done). The reward covers the transition
-        prev frame -> this frame; `done` marks death (pm_type-based) or
-        intermission -- after `done` the env has already waited for the
-        respawn, so the returned obs is the first state of the next
-        episode (GRU hidden state must be reset by the caller)."""
+        prev frame -> this frame. `done` marks an episode boundary: the
+        intermission (map restart) OR a lost sidecar connection (full
+        server restart, engine death, tunnel hiccup) -- the env
+        reconnected itself and the GRU hidden state must be reset by the
+        caller. Death is a penalty inside the episode, so the hidden
+        state survives it.
+
+        A connection failure can happen ANYWHERE in the frame walk (the
+        first snap, the absent-client wait, the post-done respawn wait --
+        an engine shutdown disconnects the client one tick BEFORE the
+        botctl channel closes, so a step can be inside _ensure_present
+        when the socket dies), so the WHOLE step is guarded, not just
+        the first snap: one reconnect per step, then a clean episode
+        boundary (reward 0 -- the partial frame is meaningless)."""
+        try:
+            return self._step()
+        except (ConnectionError, OSError):
+            self._reconnect()
+            snap = self._snap_until_new()
+            self.prev = None
+            o = self._build_obs(snap, None)
+            self.prev = snap
+            return o, 0.0, True
+
+    def _step(self):
+        """The unguarded frame walk (step() wraps it in the conn guard)."""
         snap = self._snap_until_new()
 
         # map (re)start: positions/velocities across the boundary are
@@ -319,6 +440,9 @@ class DuelEnv:
             snap = self._ensure_present(snap)
             me = self._me(snap)
             self.prev = None
+
+        # keep the QVM opponent alive (throttled, ~10 s)
+        self._ensure_opponent()
 
         r = 0.0
         done = False
@@ -333,16 +457,22 @@ class DuelEnv:
                     if me["health"] > pm_prev["health"]:
                         r += 0.05
                 elif alive_prev and (self._dead(me) or me is None):
+                    # death is a PENALTY, not a terminal state: the GRU hidden
+                    # state carries across the death->respawn transition so the
+                    # bot can learn "where I died / where the enemy is" context.
+                    # Only the intermission (map restart) is a true episode end.
                     r -= 0.5
-                    done = True
                 if alive_now:
                     e_prev = self._enemy(self.prev)
                     e_now = self._enemy(snap)
                     if e_prev is not None:
                         if e_now is not None and e_prev["health"] > e_now["health"]:
-                            r += 0.002 * (e_prev["health"] - e_now["health"])
+                            d = e_prev["health"] - e_now["health"]
+                            r += 0.002 * d
+                            self.dmg += d
                         elif e_now is None or self._dead(e_now):
                             r += 0.5  # kill
+                            self.kills += 1
             if pm in (PM_INTERMISSION, PM_SPINTERMISSION):
                 done = True
 

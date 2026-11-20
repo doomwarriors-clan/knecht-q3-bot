@@ -119,9 +119,13 @@ def main():
             done_frac=round(float(dones.mean()), 4),
             fire=round(float((acts[:, 4] > 0).mean()), 3),
             act_abs=round(float(np.abs(acts).mean()), 3),
+            dmg=round(env.dmg, 1),
+            kills=env.kills,
             tot_steps=tot_steps,
             gpu_mem_mib=int(torch.cuda.max_memory_allocated() // (1024 * 1024)),
         )
+        env.dmg = 0.0
+        env.kills = 0
         stats_f.write(json.dumps(row) + "\n")
         stats_f.flush()
         print(f"[{args.name} it {it}] {row}", flush=True)
