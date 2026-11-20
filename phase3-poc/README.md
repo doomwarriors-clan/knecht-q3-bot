@@ -21,10 +21,16 @@ knecht (192.168.69.25)                      laptop (this machine)
 - Engine branch `rl-env-2026.11.20` (knecht `~/tmp/q3e_dwc`) = `dwc` tip
   `6bb9b17e` (botctl, PR #13) + cherry-picked `64c06541` (sv_timescale).
   Binary md5 `09dd742e043912dbc84b860270b27221` (USE_BOTCTL=1).
-- Server: FFA duel (g_gametype 1) on q3dm17, opponent = `dwcbot5` (skill 5,
-  "NUDELpas") from `zzz_dwc_bots.pk3`. While `sv_timescale > 1` the engine
-  rejects all real clients (bots-only). Start/stop: `~/tmp/rl/` on knecht
-  (`start_rl_env.sh` / `stop_rl_env.sh`).
+- Server: FFA duel (g_gametype 1) with a **12-map rotation** (the dl1 Duel
+  list: pro-q3dm6 ztn3tourney1 pro-q3tourney4 q3tourney2 hub3tourney1
+  hub3aeroq3 cht3 q3tourney4 nodm9 pro-nodm9 cpm3 cpm1a — all BSP+AAS on
+  knecht), opponent = `dwcbot5` (skill 5, "NUDELpas") from
+  `zzz_dwc_bots.pk3`. While `sv_timescale > 1` the engine rejects all real
+  clients (bots-only). Rotation: this engine build has no map-list
+  rotation; the feeder (in `start_rl_env.sh`) anchors to the log "live
+  start" line and sets `nextmap "map <next>"` (read by the OSP QVM's
+  G_ExitLevel at the 60 s wall match end) + re-adds the opponent after
+  each full spawn. Start/stop: `~/tmp/rl/` on knecht (copies in this dir).
 - Tunnel (laptop): `ssh -fN -o ServerAliveInterval=10 -o ExitOnForwardFailure=yes
   -L ~/tmp/rl-lab/botctl-28134.sock:~/.q3a_rl/botctl-28134.sock hkuehnemund@192.168.69.25`
 
@@ -39,8 +45,12 @@ knecht (192.168.69.25)                      laptop (this machine)
 - `train.py` -- rollout 2048 steps + 4 epochs; stats_<name>.jsonl,
   <name>_policy.pt, <name>.pid
 - `impact.py` -- sampler: nvidia-smi + CPU + RAM + coretemp -> CSV
+- `start_rl_env.sh` / `stop_rl_env.sh` -- knecht `~/tmp/rl/` copies
+  (rotation feeder + engine start/stop; see the Topology note)
 - `recovery_test.py` -- kill/start recovery test (stop engine mid-session,
   cold start, env must reconnect + re-ADD itself + opponent comes back)
+- `rotation_test.py` -- map-rotation survival test (250 s across >= 2
+  full-spawn map changes; 0 errors + both clients back = pass)
 
 ## Run
 

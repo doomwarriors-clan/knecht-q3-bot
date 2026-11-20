@@ -126,6 +126,7 @@ class DuelEnv:
         self.dmg = 0.0
         self.kills = 0
         self._last_opp_check = 0.0
+        self._opp_absent_since = None
         self._action = np.zeros(ACT_DIM, dtype=np.float32)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._repeat_loop, daemon=True)
@@ -255,7 +256,16 @@ class DuelEnv:
         Presence is judged from the SNAPSHOT (managed clients are visible
         there but NOT in rcon 'status' -- both show up as 'bot' in the
         address column there, so rcon cannot distinguish them). rcon is
-        used only for the actual addbot. Throttled to 10 s wall."""
+        used only for the actual addbot. Throttled to 10 s wall.
+
+        ABSENCE GRACE (2026-11-20): rcon QVM bots auto-reconnect after a
+        same-process full spawn (they only truly vanish on overflow kicks
+        or a cold engine start). During the ~5-10 s spawn window the
+        snapshot is opponent-less while the bot is mid-reconnect; adding
+        a new bot there STACKS a duplicate (the original comes back too).
+        An absence therefore triggers an addbot only after 15 s of
+        continuous absence (outlasts every observed reconnect; an
+        overflow-kicked bot still comes back in ~15-25 s)."""
         now = time.time()
         if now - self._last_opp_check < 10.0:
             return
@@ -265,7 +275,14 @@ class DuelEnv:
         except Exception:
             return
         if any(n != self.slot for n in snap.players):
+            self._opp_absent_since = None
             return
+        if self._opp_absent_since is None:
+            self._opp_absent_since = now
+            return
+        if now - self._opp_absent_since < 15.0:
+            return
+        self._opp_absent_since = None
         try:
             import subprocess
             subprocess.run(self.rcon_cmd + ["addbot", "dwcbot5", "5"],
