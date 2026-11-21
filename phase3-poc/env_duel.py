@@ -100,6 +100,18 @@ WP_ONEHOT = 10
 HP_MAX = 300            # real duel max health (100 + 100 suit)
 CMD_PERIOD = 0.0025     # s wall per engine tick (25 ms game / 10x timescale)
 ABSENT_GRACE = 2.0      # s a client may be absent (map-restart cycle) before re-ADD
+STALE_SNAP_S = 35.0     # s without a new engine frame -> force reconnect
+                        # (see _snap_until_new; a real full spawn takes
+                        # <= ~20 s on this box)
+
+
+class StaleSnapshotError(ConnectionError):
+    """No new engine frame for STALE_SNAP_S: the snapshot stream is stale.
+    A nominally-live sidecar connection can serve a frozen buffer (the
+    2026-11-20 TDM stall cascade: the env kept reading a 95 s-old
+    intermission blob while the server had moved on). The step() guard
+    reacts with a FORCED re-socket + re-ADD (a plain ping would
+    "succeed" on the live-but-stale connection)."""
 
 
 def _clamp(v, lo, hi):
@@ -118,7 +130,7 @@ class DuelEnv:
         ]
         self.bc = Botctl(sockpath)
         self.bc.ping()
-        self.slot = int(self.bc.add(name))
+        self.slot = self._add_self()
         if self.slot < 0:
             raise RuntimeError("botctl ADD failed (slot -1)")
         self.last_yaw = 0.0
@@ -127,6 +139,13 @@ class DuelEnv:
         self.kills = 0
         self._last_opp_check = 0.0
         self._opp_absent_since = None
+        # intermission ready-button (see _repeat_loop): set per step by
+        # the TDM layer; stays False in duel (its intermission is short)
+        self._intermission = False
+        self._inter_ticks = 0
+        # snapshot freshness (stale watchdog in _snap_until_new)
+        self._last_snap_time = None
+        self._stale_since = None
         self._action = np.zeros(ACT_DIM, dtype=np.float32)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._repeat_loop, daemon=True)
@@ -134,6 +153,13 @@ class DuelEnv:
         self._snap_until_new(first=True)
 
     # ------------------------------------------------------------------ util
+    def _add_self(self):
+        """ADD (re-ADD) our client. TDMEnv overrides this to pass the
+        team and (re-)assert it with the client TEXT command (the ADD
+        team field is userinfo metadata only -- the game module does
+        the actual team assignment, botctl.c)."""
+        return int(self.bc.add(self.name))
+
     def _me(self, snap):
         return snap.players.get(self.slot)
 
@@ -149,15 +175,32 @@ class DuelEnv:
     def _snap_until_new(self, first=False):
         """Blocking snap request that only returns on a NEW engine frame
         (snap.time change). Sleeps 5 ms between polls so the loop costs
-        almost no CPU while the engine paces at ~400 frames/s wall."""
-        last = None
-        if first:
-            return self.bc.snap()
+        almost no CPU while the engine paces at ~400 frames/s wall.
+
+        STALE WATCHDOG (2026-11-21): the "new frame" check is tracked in
+        instance state across calls; if the same snap.time persists for
+        STALE_SNAP_S the stream is stale and StaleSnapshotError is
+        raised -> the step() guard forces a full re-socket + re-ADD.
+        (A fresh FS_Startup + QVM recompile takes <= ~20 s on this box,
+        well under the window; a frozen stream on a live connection can
+        persist indefinitely -- the 2026-11-20 TDM stall.)"""
+        last = self._last_snap_time
+        if first or last is None:
+            snap = self.bc.snap()
+            self._last_snap_time = snap.time
+            self._stale_since = None
+            return snap
         while True:
             snap = self.bc.snap()
-            if last is None or snap.time != last:
+            if snap.time != last:
+                self._last_snap_time = snap.time
+                self._stale_since = None
                 return snap
-            last = snap.time
+            if self._stale_since is None:
+                self._stale_since = time.time()
+            elif time.time() - self._stale_since > STALE_SNAP_S:
+                raise StaleSnapshotError(
+                    "botctl: no new engine frame for %d s" % int(STALE_SNAP_S))
             time.sleep(0.005)
 
     def _enemy(self, snap):
@@ -185,7 +228,22 @@ class DuelEnv:
         the bot at a full movement duty cycle. Fire-and-forget; the
         engine's 128-deep per-client queue absorbs jitter. Connection
         trouble (full server restart, tunnel hiccup) is handled by
-        step()/_reconnect; the thread just keeps retrying."""
+        step()/_reconnect; the thread just keeps retrying.
+
+        INTERMISSION READY (TDM, 2026-11-21): OSP's CheckExit (g_main.c)
+        exits the intermission only when at least one HUMAN client is
+        ready -- SVF_BOT is skipped in the ready count, and a botctl
+        managed client is human-like, so without a ready press the
+        intermission waits forever (observed: 100 s stall). The ready
+        flag is set by a RISING button edge in ClientIntermissionThink
+        (g_active.c: ATTACK/USE_HOLDABLE, 300 ms debounce); the TEXT
+        command "ready" does NOT work (OSP_Cmd_Ready_f bails with
+        "Match is already in progress!" outside warmup). While
+        self._intermission is set, tick 1 releases all buttons and every
+        later tick holds ATTACK: exactly one rising edge, exactly one
+        toggle, readyToExit 0 -> 1, exit after the 5 s intermission
+        minimum. readyToExit is reset to 0 by BeginIntermission, so one
+        edge per intermission is always the right direction."""
         while not self._stop.is_set():
             a = self._action
             try:
@@ -193,7 +251,12 @@ class DuelEnv:
                 side = int(_clamp(round(a[1] * 127.0), -127, 127))
                 yaw = (self.last_yaw + a[2] * 45.0) % 360.0
                 pitch = _clamp(a[3] * 90.0, -90.0, 90.0)
-                buttons = BUTTON_ATTACK if a[4] > 0.0 else 0
+                if self._intermission:
+                    self._inter_ticks += 1
+                    buttons = BUTTON_ATTACK if self._inter_ticks > 1 else 0
+                else:
+                    self._inter_ticks = 0
+                    buttons = BUTTON_ATTACK if a[4] > 0.0 else 0
                 self.bc.cmd(self.slot, fwd, side, 0, buttons,
                             WP_MACHINEGUN, pitch, yaw)
             except Exception:
@@ -202,18 +265,21 @@ class DuelEnv:
             self._stop.wait(CMD_PERIOD)
 
     # ------------------------------------------------------- reconnection
-    def _ensure_conn(self, budget=90.0):
+    def _ensure_conn(self, budget=90.0, force=False):
         """Ping the sidecar; if dead, reconnect until budget is spent
         (a full server restart takes ~15-20 s: FS_Startup + QVM recompile;
         a cold engine start can take ~40 s, during which the socket does
-        not exist)."""
+        not exist). force=True (stale-snapshot path): the connection can
+        be nominally alive while serving a frozen buffer, so skip the
+        initial ping and always re-socket."""
         t0 = time.time()
         while time.time() - t0 < budget:
-            try:
-                self.bc.ping()
-                return True
-            except Exception:
-                pass
+            if not force:
+                try:
+                    self.bc.ping()
+                    return True
+                except Exception:
+                    pass
             try:
                 self.bc.close()
             except Exception:
@@ -223,12 +289,14 @@ class DuelEnv:
                 self.bc = Botctl(self.sockpath)
             except Exception:
                 continue
+            force = False
         return False
 
-    def _reconnect(self):
+    def _reconnect(self, force=False):
         """Re-establish everything after losing the connection: socket,
-        client adoption, repeater thread."""
-        if not self._ensure_conn():
+        client adoption, repeater thread. force=True re-sockets even if
+        the current socket still pings (stale-snapshot path)."""
+        if not self._ensure_conn(budget=90.0, force=force):
             raise ConnectionError("botctl: could not reconnect")
         try:
             adopted = False
@@ -238,15 +306,20 @@ class DuelEnv:
                     adopted = True
                     break
             if not adopted:
-                self.slot = int(self.bc.add(self.name))
+                self.slot = self._add_self()
         except Exception:
             if not self._ensure_conn():
                 raise ConnectionError("botctl: lost again during re-ADD")
-            self.slot = int(self.bc.add(self.name))
+            self.slot = self._add_self()
         if not self._thread.is_alive():
             self._thread = threading.Thread(target=self._repeat_loop,
                                             daemon=True)
             self._thread.start()
+        # fresh snapshot-freshness window on the new connection (the
+        # stale timer from the dead connection must not fail the first
+        # post-reconnect snap)
+        self._last_snap_time = None
+        self._stale_since = None
         self.prev = None
 
     # ------------------------------------------------------- opponent guard
@@ -386,8 +459,15 @@ class DuelEnv:
         """Return a snapshot in which our client is present. If it is
         absent, wait out the map-restart disconnect/reconnect cycle
         (ABSENT_GRACE s); if it is still gone (e.g. kicked by OSP
-        'Server command overflow'), adopt an existing same-name client
-        or re-ADD ourselves."""
+        'Server command overflow', or dropped by the engine's sidecar-
+        loss cleanup), adopt an existing same-name client or re-ADD
+        ourselves.
+
+        A failed re-ADD is RAISED, never swallowed (2026-11-21): the old
+        except:pass left a zombie env with a dead slot that kept stepping
+        on nothing and served stale data indefinitely (the TDM stall
+        cascade) -- the step() guard takes a clean episode boundary and
+        retries on the next step instead."""
         if self._me(snap) is not None:
             return snap
         t0 = time.time()
@@ -395,19 +475,22 @@ class DuelEnv:
             snap = self._snap_until_new()
             if self._me(snap) is not None:
                 return snap
-        try:
-            for num, name in self.bc.list():
-                if name == self.name:
-                    self.slot = int(num)
+        for num, name in self.bc.list():
+            if name == self.name:
+                self.slot = int(num)
+                break
+        else:
+            try:
+                self.bc.remove(self.slot)
+            except Exception:
+                pass
+            for _ in range(3):
+                self.slot = self._add_self()
+                if self.slot >= 0:
                     break
-            else:
-                try:
-                    self.bc.remove(self.slot)
-                except Exception:
-                    pass
-                self.slot = int(self.bc.add(self.name))
-        except Exception:
-            pass
+                time.sleep(1.0)
+            if self.slot < 0:
+                raise ConnectionError("botctl: re-ADD failed (no free slot)")
         t0 = time.time()
         while time.time() - t0 < 10.0:
             snap = self._snap_until_new()
@@ -432,9 +515,19 @@ class DuelEnv:
         botctl channel closes, so a step can be inside _ensure_present
         when the socket dies), so the WHOLE step is guarded, not just
         the first snap: one reconnect per step, then a clean episode
-        boundary (reward 0 -- the partial frame is meaningless)."""
+        boundary (reward 0 -- the partial frame is meaningless). A
+        stale snapshot stream (frozen data on a live connection) gets a
+        FORCED re-socket: a plain ping would "succeed" and the stale
+        buffer would keep being served (the 2026-11-20 TDM cascade)."""
         try:
             return self._step()
+        except StaleSnapshotError:
+            self._reconnect(force=True)
+            snap = self._snap_until_new()
+            self.prev = None
+            o = self._build_obs(snap, None)
+            self.prev = snap
+            return o, 0.0, True
         except (ConnectionError, OSError):
             self._reconnect()
             snap = self._snap_until_new()
